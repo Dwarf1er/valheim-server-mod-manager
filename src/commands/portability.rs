@@ -1,8 +1,9 @@
+use crate::config_digests::{self, ConfigChanges};
 use crate::error::{AppError, AppResult};
 use crate::sources::{ModSource, SourceId};
 use crate::target::{GAME, Target};
 use base64::Engine as _;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use thunderstore_engine::client::ThunderstoreClient;
 use thunderstore_engine::ecosystem::Ecosystem;
@@ -130,12 +131,14 @@ pub async fn import_tracking(
   }
 
   let zip_bytes = decode_archive_or_code(client, sources, &classified).await?;
-  let (installed, source_map) =
+  let before = installed_versions(target);
+  let (installed, source_map, config_changes) =
     import_zip_with_sources(target, eco, sources, &zip_bytes, track_latest).await?;
 
   super::report_installed(target, &installed)?;
   record_resolved_sources(target, &installed, &source_map)?;
   note_latest_versions(track_latest);
+  report_changes(&before, &installed_versions(target), &config_changes);
 
   Ok(())
 }
@@ -241,8 +244,13 @@ async fn import_zip_with_sources(
   sources: &[Box<dyn ModSource>],
   zip_bytes: &[u8],
   track_latest: bool,
-) -> AppResult<(Vec<String>, HashMap<String, SourceId>)> {
+) -> AppResult<(Vec<String>, HashMap<String, SourceId>, ConfigChanges)> {
   let export = portability::read_export(zip_bytes)?;
+
+  // Compared against the profile as last applied, not against the files on
+  // disk: the server rewrites some of those itself (see `config_digests`).
+  let profile_configs = config_digests::of_profile(zip_bytes)?;
+  let config_changes = ConfigChanges::between(&config_digests::read(target), &profile_configs);
 
   let pins: HashMap<String, String> = match track_latest {
     true => HashMap::new(),
@@ -292,6 +300,7 @@ async fn import_zip_with_sources(
   }
 
   portability::extract_configs_in(&target.dir, zip_bytes)?;
+  config_digests::write(target, &profile_configs)?;
 
   let mut installed = outcome.succeeded;
 
@@ -306,7 +315,74 @@ async fn import_zip_with_sources(
       .map(|(name, version)| (name.clone(), version.clone())),
   )?;
 
-  Ok((installed, source_map))
+  Ok((installed, source_map, config_changes))
+}
+
+/// The installed mods as `full_name -> version`, for [`report_changes`].
+fn installed_versions(target: &Target) -> BTreeMap<String, String> {
+  modlist::read(&target.dir)
+    .unwrap_or_default()
+    .into_iter()
+    .map(|entry| (entry.name, entry.version_number.to_string()))
+    .collect()
+}
+
+/// Says what an import changed, with mod versions and config files under their
+/// own headings so it is clear which of the two (or both) moved.
+fn report_changes(
+  before: &BTreeMap<String, String>,
+  after: &BTreeMap<String, String>,
+  configs: &ConfigChanges,
+) {
+  let mut mod_lines = Vec::new();
+
+  for (name, version) in after {
+    match before.get(name) {
+      None => mod_lines.push(format!("  + {name} {version}")),
+      Some(old) if old != version => mod_lines.push(format!("  ~ {name} {old} -> {version}")),
+      Some(_) => {}
+    }
+  }
+
+  for (name, version) in before {
+    if !after.contains_key(name) {
+      mod_lines.push(format!("  - {name} {version}"));
+    }
+  }
+
+  let mut config_lines = Vec::new();
+
+  config_lines.extend(configs.added.iter().map(|path| format!("  + {path} (new)")));
+  config_lines.extend(configs.changed.iter().map(|path| format!("  ~ {path}")));
+  config_lines.extend(
+    configs
+      .removed
+      .iter()
+      .map(|path| format!("  - {path} (no longer in the profile; left on disk)")),
+  );
+
+  let headline = match (mod_lines.is_empty(), config_lines.is_empty()) {
+    (true, true) => {
+      println!("\nno changes: mod versions and config files already match the profile.");
+
+      return;
+    }
+    (false, true) => "mod versions changed",
+    (true, false) => "config files changed",
+    (false, false) => "mod versions and config files changed",
+  };
+
+  println!("\n{headline}");
+
+  for (heading, lines) in [("mods:", &mod_lines), ("config files:", &config_lines)] {
+    if !lines.is_empty() {
+      println!("{heading}");
+
+      for line in lines {
+        println!("{line}");
+      }
+    }
+  }
 }
 
 /// Copies an r2modman profile directory (one that already carries a `mods.yml`)
@@ -547,6 +623,37 @@ pub async fn reconcile_zip(
   zip_bytes: &[u8],
   track_latest: bool,
 ) -> AppResult<()> {
+  let before = installed_versions(target);
+  let mut config_changes = ConfigChanges::default();
+  let result = reconcile_zip_tracking(
+    eco,
+    target,
+    sources,
+    zip_bytes,
+    track_latest,
+    &mut config_changes,
+  )
+  .await;
+
+  // Reported even when pruning failed part-way: whatever did change is real.
+  // A refusal before anything was touched has nothing to report.
+  let after = installed_versions(target);
+
+  if result.is_ok() || before != after || !config_changes.is_empty() {
+    report_changes(&before, &after, &config_changes);
+  }
+
+  result
+}
+
+async fn reconcile_zip_tracking(
+  eco: &Ecosystem,
+  target: &Target,
+  sources: &[Box<dyn ModSource>],
+  zip_bytes: &[u8],
+  track_latest: bool,
+  config_changes_out: &mut ConfigChanges,
+) -> AppResult<()> {
   let previous: HashSet<String> = modlist::read(&target.dir)
     .unwrap_or_default()
     .into_iter()
@@ -571,8 +678,10 @@ pub async fn reconcile_zip(
     ));
   }
 
-  let (installed, source_map) =
+  let (installed, source_map, config_changes) =
     import_zip_with_sources(target, eco, sources, zip_bytes, track_latest).await?;
+
+  *config_changes_out = config_changes;
 
   super::report_installed(target, &installed)?;
   record_resolved_sources(target, &installed, &source_map)?;
@@ -1646,6 +1755,74 @@ mod tests {
     }
 
     buf.into_inner()
+  }
+
+  fn config_zip(files: &[(&str, &str)]) -> Vec<u8> {
+    use std::io::Write;
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    {
+      let mut zip = zip::ZipWriter::new(&mut buf);
+      let options = zip::write::SimpleFileOptions::default();
+
+      zip.start_file("export.r2x", options).unwrap();
+      zip.write_all(b"profileName: Cfg\nmods: []\n").unwrap();
+
+      for (name, body) in files {
+        zip.start_file(*name, options).unwrap();
+        zip.write_all(body.as_bytes()).unwrap();
+      }
+
+      zip.finish().unwrap();
+    }
+
+    buf.into_inner()
+  }
+
+  fn config_changes_of(
+    fixture: &Fixture,
+    target: &Target,
+    files: &[(&str, &str)],
+  ) -> ConfigChanges {
+    let eco = Ecosystem::bundled();
+    let sources = vec![fixture.thunderstore_source()];
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+
+    runtime
+      .block_on(import_zip_with_sources(
+        target,
+        &eco,
+        &sources,
+        &config_zip(files),
+        false,
+      ))
+      .unwrap()
+      .2
+  }
+
+  #[test]
+  fn config_changes_follow_the_profile_not_the_files_on_disk() {
+    let fixture = Fixture::new();
+    let target = fixture.target();
+    let cfg = target.dir.join("BepInEx/config/a.cfg");
+
+    let first = config_changes_of(&fixture, &target, &[("config/a.cfg", "k = 1")]);
+
+    assert_eq!(first.added, vec!["BepInEx/config/a.cfg".to_string()]);
+
+    // The server rewriting the file (a regenerated key, say) is not a change
+    // to the profile, and the same profile applied again reports nothing.
+    std::fs::write(&cfg, "k = regenerated").unwrap();
+
+    assert!(config_changes_of(&fixture, &target, &[("config/a.cfg", "k = 1")]).is_empty());
+
+    let edited = config_changes_of(&fixture, &target, &[("config/a.cfg", "k = 2")]);
+
+    assert_eq!(edited.changed, vec!["BepInEx/config/a.cfg".to_string()]);
+
+    let dropped = config_changes_of(&fixture, &target, &[]);
+
+    assert_eq!(dropped.removed, vec!["BepInEx/config/a.cfg".to_string()]);
   }
 
   fn installed_version(target: &Target, name: &str) -> Option<String> {

@@ -330,6 +330,7 @@ Inside `game_dir`:
   ```
 
   A mod with no `pin` tracks latest. Entries disappear when their mod is uninstalled.
+- **`.vsmm_config_digests.json`** holds a digest of each config file the last imported or synced profile carried, so `vsmm` can tell you which config files the *profile* changed rather than which differ on disk (the server rewrites some of its own). The update script restarts the server when this or the mod list changes.
 
 Inside `data_dir/valheim/`: the downloaded package cache and `.r2z` exports.
 

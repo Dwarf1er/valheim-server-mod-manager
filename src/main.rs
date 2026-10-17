@@ -1,6 +1,7 @@
 mod cli;
 mod commands;
 mod config;
+mod config_digests;
 mod error;
 mod gale_sync;
 mod logs;

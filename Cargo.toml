@@ -1,6 +1,6 @@
 [package]
 name = "valheim-server-mod-manager"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Mod manager for Valheim dedicated servers, following a Gale profile sync"
 authors = ["Endoze <endoze@endozemedia.com>", "LinkTheDot <CirnoStrongest9909@hotmail.com>", "Dwarf1er"]
@@ -38,7 +38,9 @@ indicatif = "0.18"
 reqwest = { version = "0.13", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.11"
 shellexpand = "3.1"
+tempfile = "3.10.1"
 thiserror = "2.0"
 tokio = { version = "1.32", features = ["full"] }
 toml = "1.1"
@@ -47,7 +49,6 @@ tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
 
 [dev-dependencies]
 mockito = "1.2.0"
-tempfile = "3.10.1"
 tokio-test = "0.4.3"
 zip = "8.6.0"
 
